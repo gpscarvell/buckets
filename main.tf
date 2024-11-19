@@ -15,15 +15,20 @@ resource "google_storage_bucket" "buckets" {
   }
 }
 
+
 resource "google_storage_bucket_iam_member" "buckets_iam_member" {
   for_each = {
     for bucket, config in var.buckets :
-    bucket => flatten([for role in config.iam_roles : role.members])
+    bucket => flatten([for role in config.iam_roles : for member in role.members : {
+      role    = role.role
+      member  = member
+      bucket  = bucket
+    }])
   }
 
-  bucket = google_storage_bucket.buckets[each.key].name
-  role   = var.buckets[each.key].iam_roles[0].role
-  member = each.value
+  bucket = google_storage_bucket.buckets[each.value.bucket].name
+  role   = each.value.role
+  member = each.value.member
 }
 
 
