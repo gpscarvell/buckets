@@ -15,17 +15,17 @@ resource "google_storage_bucket" "buckets" {
   }
 }
 
-resource "google_storage_bucket_iam_binding" "buckets_iam_binding" {
+resource "google_storage_bucket_iam_member" "buckets_iam_member" {
   for_each = {
     for bucket, config in var.buckets :
-    bucket => config.iam_roles
+    bucket => flatten([for role in config.iam_roles : role.members])
   }
 
   bucket = google_storage_bucket.buckets[each.key].name
-  role   = each.value[0].role
-
-  members = flatten([for role in each.value : role.members])
+  role   = var.buckets[each.key].iam_roles[0].role
+  member = each.value
 }
+
 
 output "bucket_names" {
   value = [for bucket in google_storage_bucket.buckets : bucket.name]
