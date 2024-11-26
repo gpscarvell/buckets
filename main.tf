@@ -37,96 +37,268 @@ output "bucket_names" {
 }
 
 
-#########
+###########
+
+
 
 
 trigger:
-  branches:
-    include:
-      - '*'
-
-pr:
-  branches:
-    include:
-      - '*'
+- main  # Trigger the pipeline on changes to the main branch (or
+replace with your branch)
 
 pool:
   vmImage: 'ubuntu-latest'
 
 variables:
-  argocd_server: 'your-argocd-server-url' # Replace with your ArgoCD server URL
-  repo_url: 'your-repo-url' # Replace with your Git repository URL for
-Helm charts
-  helm_chart_path: 'charts/your-helm-chart' # Path to your Helm chart directory
-  image_registry: 'your-image-registry' # Image registry URL
-  image_name: 'your-image-name' # Image name
-  image_tag: '$(Build.BuildId)' # Dynamically use BuildId for the new tag
-  argocd_app_name:
-"$(Build.Repository.Name)-$(Build.SourceBranchName)" # Set app name
-based on repo and branch
+  PROJECT_ID: 'your-gcp-project-id'  # Replace with your GCP Project ID
+  REGION: 'your-gcp-region'  # Replace with your GCP region
+  GKE_CLUSTER: 'your-gke-cluster-name'  # Replace with your GKE
+Autopilot cluster name
+  GKE_ZONE: 'your-gke-zone'  # Replace with your GKE zone (e.g.,
+'us-central1-a')
 
 steps:
 
-- task: UsePythonVersion@0
+# Step 1: Install Helm and Kubernetes External Secrets (KES)
+- task: HelmInstaller@1
+  displayName: 'Install Helm'
   inputs:
-    versionSpec: '3.x'
-    addToPath: true
+    helmVersionToInstall: 'v3.8.0'  # Specify the Helm version you need
 
 - script: |
-    echo "Installing necessary tools..."
-    curl -sSL https://github.com/argoproj/argo-cd/releases/download/v2.3.3/argocd-linux-amd64
--o /usr/local/bin/argocd
-    chmod +x /usr/local/bin/argocd
-    argocd version
-  displayName: 'Install Tools'
+    helm repo add external-secrets https://charts.external-secrets.io
+    helm repo update
+    helm install kubernetes-external-secrets
+external-secrets/kubernetes-external-secrets \
+      --namespace kube-system \
+      --create-namespace
+  displayName: 'Install Kubernetes External Secrets'
 
-# Step 1: Create ArgoCD Application if branch is created
+# Step 2: Authenticate to GCP
+- task: GoogleCloudSDK@0
+  displayName: 'Authenticate to Google Cloud'
+  inputs:
+    credentialsJson: '$(GOOGLE_CREDENTIALS_JSON)'  # The service
+account JSON key is stored as a pipeline secret
+
+# Step 3: Create the Google Cloud Service Account (GSA)
 - script: |
-    if [[ $(Build.Reason) == "Manual" || $(Build.Reason) ==
-"IndividualCI" ]]; then
-      echo "Creating ArgoCD application for the new branch..."
+    gcloud iam service-accounts create gke-secret-manager-access \
+      --display-name "GKE Secret Manager Access"
+  displayName: 'Create Google Cloud Service Account (GSA)'
 
-      # Set ArgoCD login credentials
-      argocd login $(argocd_server) --insecure --username $ARGOCD_USER
---password $ARGOCD_PASSWORD
-
-      # Create ArgoCD application with dynamic name
-      argocd app create $(argocd_app_name) \
-        --repo $(repo_url) \
-        --path $(helm_chart_path) \
-        --dest-server https://kubernetes.default.svc \
-        --dest-namespace default \
-        --revision HEAD \
-        --sync-policy automated
-
-      # Sync the application to deploy it
-      argocd app sync $(argocd_app_name)
-    fi
-  displayName: 'Create ArgoCD Application'
-  env:
-    ARGOCDB_USER: $(argocd_user)
-    ARGOCDB_PASSWORD: $(argocd_password)
-  condition: and(succeeded(), eq(variables['Build.SourceBranch'],
-'refs/heads/main'))
-
-# Step 2: Update Helm chart values file when there’s a PR
+# Step 4: Grant permissions to the GSA to access Google Secret Manager
 - script: |
-    if [[ $(Build.Reason) == "PullRequest" ]]; then
-      echo "PR detected. Updating Helm chart values file with new image tag..."
+    gcloud projects add-iam-policy-binding $(PROJECT_ID) \
+      --member="serviceAccount:gke-secret-manager-access@$(PROJECT_ID).iam.gserviceaccount.com"
+\
+      --role="roles/secretmanager.secretAccessor"
+  displayName: 'Grant permissions to the GSA'
 
-      # Check out the repo where Helm chart resides
-      git clone $(repo_url) helm-repo
-      cd helm-repo
+# Step 5: Create the Kubernetes Service Account (KSA)
+- script: |
+    kubectl create serviceaccount gke-secret-manager-ksa --namespace default
+  displayName: 'Create Kubernetes Service Account (KSA)'
 
-      # Update image tag in values.yaml
-      yq eval '.image.tag = "$(image_tag)"' -i $(helm_chart_path)/values.yaml
+# Step 6: Associate the KSA with the GSA using Workload Identity
+- script: |
+    gcloud iam service-accounts add-iam-policy-binding \
+      gke-secret-manager-access@$(PROJECT_ID).iam.gserviceaccount.com \
+      --member="serviceAccount:$(PROJECT_ID).svc.id.goog[default/gke-secret-manager-ksa]"
+\
+      --role="roles/secretmanager.secretAccessor"
+  displayName: 'Associate KSA with GSA using Workload Identity'
 
-      # Commit the change to the repo
-      git config user.email "azuredevops@yourdomain.com"
-      git config user.name "Azure DevOps"
-      git add $(helm_chart_path)/values.yaml
-      git commit -m "Update image tag to $(image_tag)"
-      git push origin HEAD:refs/heads/$(Build.SourceBranchName)
-    fi
-  displayName: 'Update Helm Chart Values for PR'
+# Step 7: Apply the SecretStore resource
+- script: |
+    cat <<EOF | kubectl apply -f -
+    apiVersion: external-secrets.io/v1beta1
+    kind: SecretStore
+    metadata:
+      name: gke-secret-manager
+      namespace: kube-system
+    spec:
+      provider:
+        gcpSecretManager:
+          projectID: $(PROJECT_ID)
+          auth:
+            workloadIdentity:
+              serviceAccountRef:
+                name: gke-secret-manager-ksa
+    EOF
+  displayName: 'Create SecretStore resource'
 
+# Step 8: Apply the ExternalSecret resource
+- script: |
+    cat <<EOF | kubectl apply -f -
+    apiVersion: external-secrets.io/v1beta1
+    kind: ExternalSecret
+    metadata:
+      name: my-secret
+      namespace: default
+    spec:
+      secretStoreRef:
+        name: gke-secret-manager
+      target:
+        name: my-k8s-secret
+        creationPolicy: Owner
+      data:
+        - secretKey: my-secret
+          remoteRef:
+            key: my-secret
+    EOF
+  displayName: 'Create ExternalSecret resource'
+
+# Step 9: Verify the Kubernetes Secret
+- script: |
+    kubectl get secret my-k8s-secret -o yaml
+  displayName: 'Verify Kubernetes Secret'
+
+
+############3
+
+
+
+trigger:
+- main  # Trigger the pipeline on changes to the main branch
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  PROJECT_ID: 'your-gcp-project-id'  # Replace with your GCP Project ID
+  GKE_CLUSTER: 'your-gke-cluster-name'  # Replace with your GKE
+Autopilot cluster name
+  GKE_ZONE: 'your-gke-zone'  # Replace with your GKE zone
+  ARGOCD_NAMESPACE: 'argocd'
+  ARGOCD_PASSWORD_SECRET_NAME: 'argocd-admin-password'  # Name of the
+secret in Google Secret Manager
+  SECRET_STORE_NAME: 'gke-secret-manager'  # SecretStore resource name
+  EXTERNAL_SECRET_NAME: 'argocd-admin-password'  # ExternalSecret resource name
+
+steps:
+
+# Step 1: Install Helm
+- task: HelmInstaller@1
+  displayName: 'Install Helm'
+  inputs:
+    helmVersionToInstall: 'v3.8.0'
+
+# Step 2: Install Kubernetes External Secrets (KES)
+- script: |
+    helm repo add external-secrets https://charts.external-secrets.io
+    helm repo update
+    helm install kubernetes-external-secrets
+external-secrets/kubernetes-external-secrets \
+      --namespace kube-system \
+      --create-namespace
+  displayName: 'Install Kubernetes External Secrets'
+
+# Step 3: Authenticate to GCP using Service Account JSON Key
+- task: GoogleCloudSDK@0
+  displayName: 'Authenticate to Google Cloud'
+  inputs:
+    credentialsJson: '$(GOOGLE_CREDENTIALS_JSON)'  # The service
+account JSON key is stored as a pipeline secret
+
+# Step 4: Install ArgoCD using Helm
+- script: |
+    helm repo add argo https://argoproj.github.io/argo-helm
+    helm repo update
+    helm install argo-cd argo/argo-cd --namespace $(ARGOCD_NAMESPACE)
+--create-namespace
+  displayName: 'Install ArgoCD'
+
+# Step 5: Create Google Cloud Service Account (GSA) to access Google
+Secret Manager
+- script: |
+    gcloud iam service-accounts create gke-secret-manager-access \
+      --display-name "GKE Secret Manager Access"
+  displayName: 'Create Google Cloud Service Account (GSA)'
+
+# Step 6: Grant the necessary permissions to the GSA to access Google
+Secret Manager
+- script: |
+    gcloud projects add-iam-policy-binding $(PROJECT_ID) \
+      --member="serviceAccount:gke-secret-manager-access@$(PROJECT_ID).iam.gserviceaccount.com"
+\
+      --role="roles/secretmanager.secretAccessor"
+  displayName: 'Grant permissions to the GSA'
+
+# Step 7: Create Kubernetes Service Account (KSA) and associate it
+with the GSA using Workload Identity
+- script: |
+    kubectl create serviceaccount gke-secret-manager-ksa --namespace default
+    gcloud iam service-accounts add-iam-policy-binding \
+      gke-secret-manager-access@$(PROJECT_ID).iam.gserviceaccount.com \
+      --member="serviceAccount:$(PROJECT_ID).svc.id.goog[default/gke-secret-manager-ksa]"
+\
+      --role="roles/secretmanager.secretAccessor"
+  displayName: 'Create and associate KSA with GSA'
+
+# Step 8: Create SecretStore resource to connect Kubernetes External
+Secrets with Google Secret Manager
+- script: |
+    cat <<EOF | kubectl apply -f -
+    apiVersion: external-secrets.io/v1beta1
+    kind: SecretStore
+    metadata:
+      name: $(SECRET_STORE_NAME)
+      namespace: kube-system
+    spec:
+      provider:
+        gcpSecretManager:
+          projectID: $(PROJECT_ID)
+          auth:
+            workloadIdentity:
+              serviceAccountRef:
+                name: gke-secret-manager-ksa
+    EOF
+  displayName: 'Create SecretStore resource'
+
+# Step 9: Create ExternalSecret to sync the ArgoCD admin password from
+Google Secret Manager
+- script: |
+    cat <<EOF | kubectl apply -f -
+    apiVersion: external-secrets.io/v1beta1
+    kind: ExternalSecret
+    metadata:
+      name: $(EXTERNAL_SECRET_NAME)
+      namespace: $(ARGOCD_NAMESPACE)
+    spec:
+      secretStoreRef:
+        name: $(SECRET_STORE_NAME)
+      target:
+        name: argocd-secret
+        creationPolicy: Owner
+      data:
+        - secretKey: admin.password
+          remoteRef:
+            key: $(ARGOCD_PASSWORD_SECRET_NAME)  # The name of the
+secret in Google Secret Manager
+    EOF
+  displayName: 'Create ExternalSecret for ArgoCD Admin Password'
+
+# Step 10: Verify the Kubernetes Secret created by ExternalSecrets
+- script: |
+    kubectl get secret argocd-secret -n $(ARGOCD_NAMESPACE) -o yaml
+  displayName: 'Verify ArgoCD Kubernetes Secret'
+
+# Step 11: Patch ArgoCD Deployment to Use the Secret as Admin Password
+- script: |
+    kubectl patch deployment argocd-server -n $(ARGOCD_NAMESPACE)
+--patch "$(cat <<EOF
+    spec:
+      template:
+        spec:
+          containers:
+          - name: argocd-server
+            env:
+            - name: ARGOCD_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: argocd-secret
+                  key: admin.password
+    EOF
+    )"
+  displayName: 'Patch ArgoCD Deployment with Admin Password'
