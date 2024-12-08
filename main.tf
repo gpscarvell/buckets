@@ -302,3 +302,90 @@ secret in Google Secret Manager
     EOF
     )"
   displayName: 'Patch ArgoCD Deployment with Admin Password'
+
+
+
+
+
+##########
+
+
+trigger:
+- main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  KUBECONFIG_PATH: '$(System.DefaultWorkingDirectory)/kubeconfig'
+  ARGOCD_APPLICATION_FILE: 'argocd-application.yaml'
+  HELM_VALUES_FILE: 'values.yaml'
+
+stages:
+- stage: Deploy
+  displayName: Deploy ArgoCD Application
+  jobs:
+  - job: DeployArgoCDApp
+    displayName: Deploy ArgoCD Application YAML
+    steps:
+    - task: DownloadSecureFile@1
+      displayName: Download kubeconfig
+      inputs:
+        secureFile: 'kubeconfig' # Replace with your secure file name
+
+    - script: |
+        mkdir -p ~/.kube
+        cp $(KUBECONFIG_PATH) ~/.kube/config
+        chmod 600 ~/.kube/config
+      displayName: Configure kubeconfig
+
+    - script: |
+        cat <<EOF > $(ARGOCD_APPLICATION_FILE)
+        apiVersion: argoproj.io/v1alpha1
+        kind: Application
+        metadata:
+          name: my-helm-app
+          namespace: argocd
+        spec:
+          project: default
+          source:
+            repoURL: https://github.com/my-org/my-repo.git
+            targetRevision: main
+            path: charts/my-helm-chart
+            helm:
+              valueFiles:
+              - $(HELM_VALUES_FILE)
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: my-namespace
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+        EOF
+      displayName: Generate ArgoCD Application YAML
+
+    - script: |
+        cat <<EOF > $(HELM_VALUES_FILE)
+        replicaCount: 3
+        image:
+          repository: my-docker-repo/my-app
+          tag: latest
+        service:
+          type: ClusterIP
+          port: 8080
+        EOF
+      displayName: Generate Helm Values File
+
+    - task: Kubernetes@1
+      displayName: Apply ArgoCD Application YAML
+      inputs:
+        connectionType: 'KubeConfig'
+        kubeconfig: '$(KUBECONFIG_PATH)'
+        command: 'apply'
+        arguments: '-f $(ARGOCD_APPLICATION_FILE)'
+
+    - script: |
+        kubectl get applications.argoproj.io -n argocd
+      displayName: Verify Deployment
+
