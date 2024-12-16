@@ -389,3 +389,82 @@ stages:
         kubectl get applications.argoproj.io -n argocd
       displayName: Verify Deployment
 
+
+######################
+
+trigger:
+  branches:
+    include:
+      - feature/*
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  GITHUB_REPO: '<github-org>/<app-of-apps-repo>'
+  FEATURE_BRANCH_YAML: ''
+  GITHUB_TOKEN: $(githubToken) # GitHub PAT stored in ADO variable group
+  ARTIFACTORY_REPO_URL: '<artifactory-oci-repo-url>' # Replace with the actual OCI repo URL
+  ARTIFACTORY_NAMESPACE: '<k8s-namespace>' # Replace with desired namespace in Kubernetes
+
+steps:
+  # Step 1: Determine feature branch name from pipeline branch
+  - script: |
+      echo "##vso[task.setvariable variable=FEATURE_BRANCH_NAME]$(echo ${BUILD_SOURCEBRANCH#refs/heads/})"
+      echo "##vso[task.setvariable variable=FEATURE_BRANCH_YAML]argocd/feature-$(echo ${BUILD_SOURCEBRANCH#refs/heads/}).yaml"
+    displayName: "Determine Feature Branch Name"
+
+  # Step 2: Checkout code
+  - task: Checkout@1
+
+  # Step 3: Clone the GitHub App of Apps repository
+  - script: |
+      git clone https://$(GITHUB_TOKEN)@github.com/${{ variables.GITHUB_REPO }} repo
+      cd repo
+    displayName: "Clone GitHub App of Apps Repo"
+
+  # Step 4: Check if the ArgoCD YAML for the feature branch exists
+  - script: |
+      cd repo
+      if [ -f "${FEATURE_BRANCH_YAML}" ]; then
+        echo "Feature branch YAML already exists. Skipping creation."
+        exit 0
+      fi
+    displayName: "Check if Feature Branch YAML Exists"
+
+  # Step 5: Generate the ArgoCD YAML if it doesn't exist
+  - script: |
+      cd repo
+      cat <<EOF > $FEATURE_BRANCH_YAML
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: feature-${FEATURE_BRANCH_NAME}
+        namespace: argocd
+      spec:
+        project: default
+        source:
+          repoURL: oci://${ARTIFACTORY_REPO_URL}
+          chart: feature-${FEATURE_BRANCH_NAME}
+          targetRevision: latest
+        destination:
+          server: https://kubernetes.default.svc
+          namespace: ${ARTIFACTORY_NAMESPACE}
+        syncPolicy:
+          automated:
+            prune: true
+            selfHeal: true
+      EOF
+    displayName: "Generate Feature Branch YAML for Artifactory OCI Repository"
+
+  # Step 6: Commit and push the YAML to the GitHub App of Apps repository
+  - script: |
+      cd repo
+      git config user.name "ADO Pipeline"
+      git config user.email "pipeline@devops.com"
+      git add ${FEATURE_BRANCH_YAML}
+      git commit -m "Add ArgoCD config for feature branch: $FEATURE_BRANCH_NAME"
+      git push origin main
+    displayName: "Commit and Push YAML"
+
+
