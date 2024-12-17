@@ -470,5 +470,41 @@ data:
   password: <BASE64_ENCODED_PASSWORD>
 
 
+############
+
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: argocd-initial-admin-secret
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-initial-admin-secret
+    app.kubernetes.io/part-of: argocd
+    app.kubernetes.io/component: server
+    app.kubernetes.io/instance: argocd
+    argocd.argoproj.io/secret-type: admin
+spec:
+  secretStoreRef:
+    name: my-secret-store # Reference to your configured SecretStore or ClusterSecretStore
+    kind: SecretStore
+  target:
+    name: argocd-initial-admin-secret # The Kubernetes Secret name created by External Secrets
+    template:
+      type: Opaque
+      metadata:
+        labels:
+          app.kubernetes.io/name: argocd-initial-admin-secret
+          app.kubernetes.io/part-of: argocd
+          app.kubernetes.io/component: server
+          app.kubernetes.io/instance: argocd
+          argocd.argoproj.io/secret-type: admin
+  data:
+    - secretKey: password # Key in the external secret store
+      remoteRef:
+        key: path/to/argocd-initial-admin-secret # Path in your secret manager
+        property: password # Specific property for the password
+
+
+
 
 
