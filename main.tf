@@ -505,6 +505,31 @@ spec:
         property: password # Specific property for the password
 
 
+##########
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: restart-deployment
+  namespace: default
+spec:
+  schedule: "0 3 * * *" # Adjust the schedule to your needs (e.g., daily at 3 AM)
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: restart
+            image: bitnami/kubectl:latest # Or any lightweight image with `kubectl`
+            command:
+            - /bin/sh
+            - -c
+            - |
+              kubectl rollout restart deployment <deployment-name> -n <namespace>
+          restartPolicy: Never
+
+
+
 
 
 
