@@ -393,78 +393,63 @@ stages:
 ######################
 
 trigger:
-  branches:
-    include:
-      - feature/*
+- main
+- feature/*
 
-pool:
-  vmImage: 'ubuntu-latest'
+stages:
+- stage: BuildAndPushHelmChart
+  displayName: Package and Push Helm Chart
+  jobs:
+  - job: PackageAndPush
+    displayName: Package Helm Chart and Push to OCI
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: self
 
-variables:
-  GITHUB_REPO: '<github-org>/<app-of-apps-repo>'
-  FEATURE_BRANCH_YAML: ''
-  GITHUB_TOKEN: $(githubToken) # GitHub PAT stored in ADO variable group
-  ARTIFACTORY_REPO_URL: '<artifactory-oci-repo-url>' # Replace with the actual OCI repo URL
-  ARTIFACTORY_NAMESPACE: '<k8s-namespace>' # Replace with desired namespace in Kubernetes
+    # Package the Helm chart
+    - task: HelmInstaller@1
+      inputs:
+        helmVersion: 'latest'
+    - script: |
+        helm dependency update ./helm-chart
+        helm package ./helm-chart -d ./helm-packages
+      displayName: Package Helm Chart
 
-steps:
-  # Step 1: Determine feature branch name from pipeline branch
-  - script: |
-      echo "##vso[task.setvariable variable=FEATURE_BRANCH_NAME]$(echo ${BUILD_SOURCEBRANCH#refs/heads/})"
-      echo "##vso[task.setvariable variable=FEATURE_BRANCH_YAML]argocd/feature-$(echo ${BUILD_SOURCEBRANCH#refs/heads/}).yaml"
-    displayName: "Determine Feature Branch Name"
+    # Push the Helm chart to the OCI registry
+    - script: |
+        helm registry login oci://your-oci-registry-url \
+          --username $(OCI_USERNAME) \
+          --password $(OCI_PASSWORD)
+        helm push ./helm-packages/your-chart-name-*.tgz oci://your-oci-registry-url/your-namespace
+      displayName: Push Helm Chart to OCI Registry
+      env:
+        OCI_USERNAME: $(OCI_USERNAME)
+        OCI_PASSWORD: $(OCI_PASSWORD)
 
-  # Step 2: Checkout code
-  - task: Checkout@1
+- stage: UpdateArgoCD
+  displayName: Update ArgoCD Application
+  dependsOn: BuildAndPushHelmChart
+  condition: succeeded()
+  jobs:
+  - job: UpdateArgo
+    displayName: Update ArgoCD Revision
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - script: |
+        # Login to ArgoCD using a GitHub token
+        argocd login $(ARGOCD_SERVER) \
+          --username $(GITHUB_USERNAME) \
+          --password $(GITHUB_TOKEN) \
+          --insecure
+        argocd app set your-app-name --helm-set chart=oci://your-oci-registry-url/your-namespace/your-chart-name@$(Build.BuildId)
+        argocd app sync your-app-name
+      displayName: Update ArgoCD Application
+      env:
+        ARGOCD_SERVER: $(ARGOCD_SERVER)
+        GITHUB_USERNAME: $(GITHUB_USERNAME)
+        GITHUB_TOKEN: $(GITHUB_TOKEN)
 
-  # Step 3: Clone the GitHub App of Apps repository
-  - script: |
-      git clone https://$(GITHUB_TOKEN)@github.com/${{ variables.GITHUB_REPO }} repo
-      cd repo
-    displayName: "Clone GitHub App of Apps Repo"
-
-  # Step 4: Check if the ArgoCD YAML for the feature branch exists
-  - script: |
-      cd repo
-      if [ -f "${FEATURE_BRANCH_YAML}" ]; then
-        echo "Feature branch YAML already exists. Skipping creation."
-        exit 0
-      fi
-    displayName: "Check if Feature Branch YAML Exists"
-
-  # Step 5: Generate the ArgoCD YAML if it doesn't exist
-  - script: |
-      cd repo
-      cat <<EOF > $FEATURE_BRANCH_YAML
-      apiVersion: argoproj.io/v1alpha1
-      kind: Application
-      metadata:
-        name: feature-${FEATURE_BRANCH_NAME}
-        namespace: argocd
-      spec:
-        project: default
-        source:
-          repoURL: oci://${ARTIFACTORY_REPO_URL}
-          chart: feature-${FEATURE_BRANCH_NAME}
-          targetRevision: latest
-        destination:
-          server: https://kubernetes.default.svc
-          namespace: ${ARTIFACTORY_NAMESPACE}
-        syncPolicy:
-          automated:
-            prune: true
-            selfHeal: true
-      EOF
-    displayName: "Generate Feature Branch YAML for Artifactory OCI Repository"
-
-  # Step 6: Commit and push the YAML to the GitHub App of Apps repository
-  - script: |
-      cd repo
-      git config user.name "ADO Pipeline"
-      git config user.email "pipeline@devops.com"
-      git add ${FEATURE_BRANCH_YAML}
-      git commit -m "Add ArgoCD config for feature branch: $FEATURE_BRANCH_NAME"
-      git push origin main
-    displayName: "Commit and Push YAML"
 
 
