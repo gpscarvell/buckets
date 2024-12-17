@@ -452,4 +452,23 @@ stages:
         GITHUB_TOKEN: $(GITHUB_TOKEN)
 
 
+############
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: argocd-initial-admin-secret
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-initial-admin-secret
+    app.kubernetes.io/part-of: argocd
+    app.kubernetes.io/component: server
+    app.kubernetes.io/instance: argocd
+    argocd.argoproj.io/secret-type: admin
+type: Opaque
+data:
+  password: <BASE64_ENCODED_PASSWORD>
+
+
+
 
